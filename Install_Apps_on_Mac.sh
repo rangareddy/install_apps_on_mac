@@ -1,5 +1,16 @@
 #!/bin/sh
 
+
+#################################################################################################################################                                                                                                 
+#    Name: Install_Apps_on_Mac.sh                                                                                               #
+#    Purpose: Installing Development Applications on Mac OS                                                                     #
+#    Author: Ranga Reddy                                                                                                        #
+#    Created Date: 27-Sep-2020                                                                                                  #   
+#    Version: v1.0                                                                                                              #
+#                                                                                                                               #
+#################################################################################################################################
+
+echo ""
 echo "Installing Applications"
 
 HOMEBREW_URL='https://raw.githubusercontent.com/Homebrew/install/master/install'
@@ -9,7 +20,7 @@ command_exists () {
     type "$1" &> /dev/null ;
 }
 
-############ Install Homebrew ############
+
 if ! command_exists brew ; then
   echo "Installing HomeBrew..." 
   # supress the need to press 'return' when in the install script runs. 
@@ -17,7 +28,7 @@ if ! command_exists brew ; then
 fi
 
 if ! command_exists brew ; then
-  echo "Brew not installed... exit"
+  echo "Brew not installed... exiting"
   exit 0
 fi
 
