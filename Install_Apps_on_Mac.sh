@@ -32,6 +32,11 @@ if ! command_exists brew ; then
   exit 0
 fi
 
+if ! command_exists telnet ; then
+  echo "Installing telnet..."
+  brew install telnet
+fi
+
 if ! command_exists git ; then
   echo "Installing git..."
   brew install git
@@ -83,4 +88,13 @@ if ! command_exists subl ; then
   brew cask install  --appdir='/Applications' 'sublime-text'
 fi
 
-echo "Applications installed successfully"
+if ! command_exists mysql ; then
+  echo "Installing MySQL..."
+  brew install mysql@5.7
+  echo 'export PATH="/usr/local/opt/mysql@5.7/bin:$PATH"' >> ~/.bash_profile
+  source ~/.bash_profile;
+  brew services start mysql@5.7
+  /usr/local/opt/mysql@5.7/bin/mysqladmin -u root password 'root'
+fi
+
+echo "Applications installed successfully"    
