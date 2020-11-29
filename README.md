@@ -10,3 +10,5 @@ The following apps will be installed.
 * intellij community
 * java
 * maven
+* gradle
+* mysql
