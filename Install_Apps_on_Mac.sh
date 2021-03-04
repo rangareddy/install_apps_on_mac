@@ -154,4 +154,15 @@ if ! command_exists mysql ; then
   /usr/local/opt/mysql@5.7/bin/mysqladmin -u root password 'root'
 fi
 
+# docker
+if ! command_exists docker ; then
+  #brew --cask install --appdir='/Applications' 'docker'
+  brew install docker docker-compose docker-machine
+  brew install --cask virtualbox
+fi
+
+#brew cask install docker
+#brew install kubectl
+#brew cask install minikube
+
 echo "Applications installed successfully"    
