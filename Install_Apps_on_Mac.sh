@@ -52,6 +52,11 @@ if ! command_exists wget ; then
   brew install wget
 fi
 
+# jq
+if ! command_exists jq ; then
+  brew install jq
+fi
+
 # visual studio
 if ! command_exists code ; then
   echo "Installing Visual Studio code..."
@@ -94,7 +99,6 @@ if ! command_exists scala ; then
     echo "Verifying SCALA_HOME path"
     echo $SCALA_HOME
   fi
-
 fi
 
 # maven
@@ -156,13 +160,37 @@ fi
 
 # docker
 if ! command_exists docker ; then
-  #brew --cask install --appdir='/Applications' 'docker'
-  brew install docker docker-compose docker-machine
-  brew install --cask virtualbox
+  brew install --cask --appdir='/Applications' 'docker'
+  brew install docker-compose
+  brew link --overwrite docker-compose
 fi
 
-#brew cask install docker
-#brew install kubectl
-#brew cask install minikube
+# virtualbox
+if ! command_exists virtualbox ; then
+  brew install virtualbox
+  if ! command_exists virtualbox ; then
+      echo "To install and/or use virtualbox you may need to enable its kernel extension in: System Preferences → Security & Privacy → General"
+      exit 1
+  fi
+fi 
+
+# docker-machine
+if ! command_exists docker-machine ; then
+  brew install docker-machine
+  docker-machine create --driver virtualbox default
+  docker-machine env default
+  eval $(docker-machine env default)
+  docker-machine stop default
+fi
+
+# kubectl
+if ! command_exists kubectl ; then
+  brew install kubectl
+fi
+
+# minikube
+if ! command_exists minikube ; then
+  brew install minikube
+fi
 
 echo "Applications installed successfully"    
