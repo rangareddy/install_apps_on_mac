@@ -12,7 +12,7 @@ Download the `Install_Apps_on_Mac.sh` file from `https://github.com/rangareddy/i
 sh Install_Apps_on_Mac.sh
 ```
 
-> You need to run the above script with root user.
+> You need to run the above script with root user. For example 'sudo -u rangareddy sh Install_Apps_on_Mac.sh'
 
 ## List of Applications
 
