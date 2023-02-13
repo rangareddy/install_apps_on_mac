@@ -10,17 +10,28 @@
 #                                                                                                                               #
 #################################################################################################################################
 
+echo ""
+echo "==================================="
 echo "Installing Applications on Mac"
+echo "==================================="
 
 export HOMEBREW_URL='https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh'
 export HOMEBREW_CELLAR_PATH='/opt/homebrew/Cellar/'
 export HOMEBREW_NO_INSTALL_CLEANUP=true
 export ENV_FILE_PATH=~/.bash_profile
 
+#INSTALL_BASIC_APPS_LIST=("telnet" "git" "wget" "jq" "bash-completion" "iterm2" "tree" "youtube-dl" "nmap" "git-lfs" "p7zip" "netcat" "htop" "tmux" "task" "imagemagick")
+INSTALL_BASIC_APPS_LIST=("git" "wget" "telnet" "netcat" "jq" "bash-completion" "iterm2" "tree")
+
+#INSTALL_ADVANCED_APPS_LIST=("code" "java" "scala" "maven" "idea" "gradle" "mysql" "sublime" "sbt" "cmake" "firefox" "vlc" "gimp")
+INSTALL_ADVANCED_APPS_LIST=("code" "java" "maven" "idea" "mysql" "sublime")
+
+# Checking commands exists or not
 command_exists () {
   type "$1" &> /dev/null ;
 }
 
+# Install Brew
 install_brew_software() {
   # brew
   if ! command_exists brew ; then
@@ -32,6 +43,7 @@ install_brew_software() {
   fi
 }
 
+# Update Brew
 update_brew_software() {
   if ! command_exists brew ; then
     echo "Brew not installed... exiting"
@@ -40,6 +52,7 @@ update_brew_software() {
   brew update > /dev/null 2>&1 &
 }
 
+# Install applications
 brew_install() {
   app_name=$1
   if ! brew list "$app_name" &>/dev/null; then
@@ -48,6 +61,7 @@ brew_install() {
   fi
 }
 
+# Install applications using cask
 brew_cask_install() {
   app_name=$1
   if ! brew list "$app_name" &>/dev/null; then
@@ -83,6 +97,7 @@ install_sbt() {
   brew_install 'sbt'
 }
 
+# Updating the variable in Env file
 update_path() {
   VARIABLE_NAME="$1"
   VARIABLE_VALUE="$2"
@@ -97,6 +112,7 @@ update_path() {
   source $ENV_FILE_PATH
 }
 
+# Source the Env file
 source_env_file() {
   if [ -f "$ENV_FILE_PATH" ]; then
     source "$ENV_FILE_PATH"
@@ -163,20 +179,22 @@ install_gradle() {
 
 # Install Basic Applications
 install_basic_apps() {
+  echo ""
   echo "Installing basic applications"
-  for app_name in "${install_basic_apps_list[@]}"
+  for app_name in "${INSTALL_BASIC_APPS_LIST[@]}"
   do
      brew_install "$app_name"
   done
-  echo "Successfully installed the basic applications"
+  echo "Successfully installed the basic applications."
 }
 
 fn_exists() { declare -F "$1" > /dev/null; }
 
 # Install Advanced Applications
 install_advanced_apps() {
+  echo ""
   echo "Installing advanced applications"
-  for app_name in "${install_advanced_apps_list[@]}"
+  for app_name in "${INSTALL_ADVANCED_APPS_LIST[@]}"
   do
      if ! fn_exists "install_$app_name"; then
         brew_cask_install "$app_name"
@@ -184,15 +202,10 @@ install_advanced_apps() {
         install_"$app_name"
      fi
   done
-  echo "Successfully installed the advanced applications"
+  echo "Successfully installed the advanced applications."
 }
-
-install_basic_apps_list=("telnet" "git" "wget" "jq" "bash-completion" "iterm2" "tree" "youtube-dl" "nmap" "git-lfs" "p7zip" "netcat" "htop" "tmux" "tldr" "grip" "task" "speedtest_cli" "calc" "imagemagick")
-install_advanced_apps_list=("code" "java" "scala" "maven" "idea" "gradle" "mysql" "sublime" "sbt" "cmake" "firefox" "vlc" "gimp")
 
 install_brew_software
 update_brew_software
 install_basic_apps
 install_advanced_apps
-
-echo "Applications installed successfully"
