@@ -16,15 +16,26 @@ sh Install_Apps_on_Mac.sh
 
 ## List of Applications
 
-The following apps will be installed.
+The following applications will be installed.
 
 * brew
 * git
 * wget
+* bash-completion
+* iterm2
+* youtube-d
+* netcat
+* tmux
 * Visual studio code
 * Intellij community
 * Java
 * Maven
 * Gradle
+* Sbt
+* Scala
 * Mysql
 * Sublime
+* Firefox
+* Vlc
+
+etc..
