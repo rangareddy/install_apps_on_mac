@@ -5,8 +5,8 @@
 #                (arm64: M1/M2/M3/M4) and Intel (x86_64) Macs.
 # Author       : Ranga Reddy
 # Created Date : 27-Sep-2020
-# Updated Date : 08-Sep-2026
-# Version      : v2.0
+# Updated Date : 10-Sep-2026
+# Version      : v2.1
 #
 # Usage        : ./Install_Apps_on_Mac.sh [OPTIONS] [APP ...]
 #                ./Install_Apps_on_Mac.sh --help
@@ -20,8 +20,9 @@
 set -uo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
-SCRIPT_VERSION="2.0"
+SCRIPT_VERSION="2.1"
 MANAGED_BLOCK_TAG="install_apps_on_mac"
+MANAGED_RC_TAG="install_apps_on_mac-sdkman"
 
 HOMEBREW_INSTALL_URL="https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh"
 export HOMEBREW_NO_INSTALL_CLEANUP=1
@@ -36,8 +37,19 @@ export HOMEBREW_NO_ENV_HINTS=1
 BASIC_APPS_LIST=(git wget telnet netcat jq bash-completion iterm2 tree)
 ADVANCED_APPS_LIST=(code java maven idea mysql sublime)
 
-# Java version installed by the `java` app. Override with --jdk-version.
-JDK_VERSION="17"
+# JDKs the `java` app installs, via SDKMAN. Comma-separated feature versions;
+# override with --jdk-versions. JDK_DEFAULT is the one made the SDKMAN default
+# and defaults to the highest version in the list.
+JDK_VERSIONS="11,17,21"
+JDK_DEFAULT=""
+
+# SDKMAN vendor preference, highest first. Order matters for Java 8 on Apple
+# Silicon: Temurin publishes no macOS aarch64 build for 8, Zulu does. Early
+# access builds (the `open` vendor) are deliberately excluded.
+SDKMAN_JAVA_VENDORS="tem zulu amzn librca"
+
+SDKMAN_INSTALL_URL="https://get.sdkman.io"
+SDKMAN_API_URL="https://api.sdkman.io/2"
 
 # ------------------------------------------------------------------------------
 # Runtime state
@@ -49,6 +61,10 @@ RUNNING_UNDER_ROSETTA=0
 HOMEBREW_PREFIX=""
 BREW_BIN=""
 SHELL_PROFILE=""
+SHELL_RC=""
+SDKMAN_JAVA_LIST_FILE=""
+SDKMAN_CANDIDATE_LIST=""
+SDKMAN_ANNOUNCED=0
 
 DRY_RUN=0
 LIST_ONLY=0
@@ -80,6 +96,12 @@ log_step()  { printf '\n%s\n' "${C_BOLD}==> $*${C_RESET}"; }
 
 die() { log_error "$*"; exit 1; }
 
+cleanup() {
+  [ -n "${SDKMAN_JAVA_LIST_FILE:-}" ] && rm -f "$SDKMAN_JAVA_LIST_FILE"
+  return 0
+}
+trap cleanup EXIT
+
 # Print the command instead of running it when --dry-run is active.
 run() {
   if [ "$DRY_RUN" -eq 1 ]; then
@@ -105,8 +127,12 @@ ${C_BOLD}OPTIONS${C_RESET}
   -a, --advanced           Install the advanced application list only.
       --all                Install both lists. This is the default when no
                            option and no APP argument is given.
-  -j, --jdk-version VER    JDK feature version for the 'java' app
-                           (8, 11, 17, 21, ...). Default: $JDK_VERSION
+  -j, --jdk-versions LIST  Comma-separated JDK feature versions to install via
+                           SDKMAN (for example 11,17,21). Default: $JDK_VERSIONS
+      --jdk-default VER    Which of those becomes the SDKMAN default.
+                           Default: the highest version installed.
+      --jdk-version VER    Alias for installing a single JDK and defaulting to
+                           it, kept for compatibility.
   -n, --dry-run            Print what would be installed, change nothing.
   -l, --list               Show the resolved application lists and exit.
   -s, --skip-update        Do not run 'brew update' before installing.
@@ -116,31 +142,95 @@ ${C_BOLD}OPTIONS${C_RESET}
 
 ${C_BOLD}APP${C_RESET}
   One or more application names to install instead of the default lists. An
-  alias from the table below, or any Homebrew formula or cask token; the script
-  resolves formula first, then cask.
+  alias from the table below, or any Homebrew formula or cask token; unknown
+  names resolve as a Homebrew formula first, then a cask.
+
+  Prefixes force a particular installer:
+    sdk:<candidate>[@<version>]   an SDKMAN candidate, optionally pinned
+    brew:<formula>                a Homebrew formula
+    cask:<token>                  a Homebrew cask
 
 ${C_BOLD}ALIASES${C_RESET}
-  code, vscode      -> visual-studio-code (cask)
-  idea, intellij    -> intellij-idea (cask)
-  sublime           -> sublime-text (cask)
-  java, jdk         -> architecture-appropriate JDK + JAVA_HOME
-  maven, mvn        -> maven + M2_HOME
-  gradle            -> gradle + GRADLE_HOME
-  scala             -> scala@2.12 + SCALA_HOME
-  mysql             -> mysql server + MySQL Workbench
+  Homebrew casks:
+    code, vscode    -> visual-studio-code
+    idea, intellij  -> intellij-idea
+    sublime         -> sublime-text
+    iterm, iterm2   -> iterm2
+    mysql           -> mysql server + MySQL Workbench
+
+  SDKMAN, so several versions coexist and can be switched:
+    java, jdk       -> the JDKs in --jdk-versions
+    maven, mvn      -> maven (also mirrors MAVEN_HOME to M2_HOME)
+    mvnd            -> the Maven daemon
+    gradle          -> gradle
+    scala           -> scala
+    scalacli        -> scala-cli
+    sbt             -> sbt
+    kotlin          -> kotlin
+    groovy          -> groovy
+    ant             -> ant
+    leiningen, lein -> leiningen
+    jbang           -> jbang
+    spark           -> Apache Spark
+    flink           -> Apache Flink
+    hadoop          -> Apache Hadoop
+    springboot      -> Spring Boot CLI
+    quarkus         -> Quarkus CLI
+    micronaut       -> Micronaut CLI
+    visualvm        -> VisualVM
+    jmc             -> JDK Mission Control
+    jmeter          -> Apache JMeter
+    liquibase       -> Liquibase
+    tomcat          -> Apache Tomcat
+
+  'sdk list' shows every candidate SDKMAN offers, not just these aliases; reach
+  any of them with the sdk: prefix.
 
 ${C_BOLD}EXAMPLES${C_RESET}
   $SCRIPT_NAME                          # install everything
   $SCRIPT_NAME --basic                  # basic list only
   $SCRIPT_NAME --dry-run --all          # preview the full run
   $SCRIPT_NAME java maven gradle        # just the JVM toolchain
-  $SCRIPT_NAME --jdk-version 21 java    # JDK 21 instead of $JDK_VERSION
+  $SCRIPT_NAME -j 11,17,21 java         # three JDKs, newest as default
+  $SCRIPT_NAME --jdk-default 17 java    # install the list, default to 17
   $SCRIPT_NAME docker rectangle         # arbitrary casks
+  $SCRIPT_NAME spark flink              # Spark and Flink via SDKMAN
+  $SCRIPT_NAME sdk:scala@2.13.13        # a pinned Scala, as a Spark build needs
+  $SCRIPT_NAME sdk:quarkus              # any SDKMAN candidate, by name
+  $SCRIPT_NAME brew:ripgrep             # force the Homebrew formula
+
+${C_BOLD}JVM TOOLCHAIN${C_RESET}
+  Java and the rest of the JVM toolchain are installed with SDKMAN so several
+  versions can coexist and be switched:
+
+    sdk list java                 show installed and available builds
+    sdk use java 17.0.20-tem      switch this shell only
+    sdk default java 21.0.12-tem  change the default for new shells
+    sdk use scala 2.13.13         the same works for every candidate
+
+  SDKMAN exports <CANDIDATE>_HOME for whatever is current, so JAVA_HOME,
+  MAVEN_HOME, SPARK_HOME and the rest are set for you.
+
+  Vendors are tried in this order: $SDKMAN_JAVA_VENDORS. That order matters on
+  Apple Silicon, where Temurin has no macOS aarch64 build for Java 8 and Zulu
+  does. Exact identifiers are resolved from SDKMAN at run time, so they do not
+  go stale.
 
 ${C_BOLD}NOTES${C_RESET}
   Run as a normal user, not with sudo. Homebrew refuses to run as root and will
   ask for your password only when a cask needs it.
 EOF
+}
+
+# Every entry must be a bare feature number: 8, 11, 17, 21.
+validate_jdk_list() {
+  local list="$1" flag="$2" entry
+  [ -n "$list" ] || die "$flag needs at least one version"
+  for entry in $(printf '%s' "$list" | tr ',' ' '); do
+    case "$entry" in
+      ''|*[!0-9]*) die "$flag takes feature numbers such as 8, 11, 17 or 21; got '$entry'" ;;
+    esac
+  done
 }
 
 parse_args() {
@@ -149,12 +239,18 @@ parse_args() {
       -b|--basic)       DO_BASIC=1 ;;
       -a|--advanced)    DO_ADVANCED=1 ;;
       --all)            DO_BASIC=1; DO_ADVANCED=1 ;;
-      -j|--jdk-version)
+      -j|--jdk-versions)
+        [ "$#" -ge 2 ] || die "--jdk-versions needs a value (for example: 11,17,21)"
+        validate_jdk_list "$2" "--jdk-versions"
+        JDK_VERSIONS="$2"; shift ;;
+      --jdk-default)
+        [ "$#" -ge 2 ] || die "--jdk-default needs a value (for example: 21)"
+        validate_jdk_list "$2" "--jdk-default"
+        JDK_DEFAULT="$2"; shift ;;
+      --jdk-version)
         [ "$#" -ge 2 ] || die "--jdk-version needs a value (for example: 17)"
-        case "$2" in
-          ''|*[!0-9]*) die "--jdk-version must be a feature number such as 8, 11, 17 or 21; got '$2'" ;;
-        esac
-        JDK_VERSION="$2"; shift ;;
+        validate_jdk_list "$2" "--jdk-version"
+        JDK_VERSIONS="$2"; JDK_DEFAULT="$2"; shift ;;
       -n|--dry-run)     DRY_RUN=1 ;;
       -s|--skip-update) SKIP_BREW_UPDATE=1 ;;
       -y|--yes)         ASSUME_YES=1 ;;
@@ -230,14 +326,30 @@ detect_homebrew_prefix() {
   return 1
 }
 
-# Pick the profile the user's login shell actually reads. The original script
-# hardcoded ~/.bash_profile, which zsh (the macOS default since Catalina) never
-# sources.
-detect_shell_profile() {
+# Two different files are needed.
+#
+# SHELL_PROFILE is the login profile and carries PATH and *_HOME exports. The
+# original script hardcoded ~/.bash_profile, which zsh (the macOS default since
+# Catalina) never sources.
+#
+# SHELL_RC is the interactive rc file and carries SDKMAN's init line, because
+# `sdk` is a shell function that has to be defined in every interactive shell,
+# not only in login shells. Putting it in the profile would leave `sdk` missing
+# from any non-login shell.
+detect_shell_files() {
   case "${SHELL##*/}" in
-    zsh)  SHELL_PROFILE="$HOME/.zprofile" ;;
-    bash) SHELL_PROFILE="$HOME/.bash_profile" ;;
-    *)    SHELL_PROFILE="$HOME/.profile" ;;
+    zsh)
+      SHELL_PROFILE="$HOME/.zprofile"
+      SHELL_RC="${ZDOTDIR:-$HOME}/.zshrc"
+      ;;
+    bash)
+      SHELL_PROFILE="$HOME/.bash_profile"
+      SHELL_RC="$HOME/.bashrc"
+      ;;
+    *)
+      SHELL_PROFILE="$HOME/.profile"
+      SHELL_RC="$HOME/.profile"
+      ;;
   esac
 }
 
@@ -298,7 +410,9 @@ print_system_summary() {
     "$([ "$IS_APPLE_SILICON" -eq 1 ] && echo 'Apple Silicon' || echo 'Intel')"
   printf '  Homebrew prefix  : %s\n' "$HOMEBREW_PREFIX"
   printf '  Shell profile    : %s\n' "$SHELL_PROFILE"
-  printf '  JDK version      : %s\n' "$JDK_VERSION"
+  printf '  Shell rc file    : %s\n' "$SHELL_RC"
+  printf '  JDKs to install  : %s (default %s)\n' "$JDK_VERSIONS" \
+    "${JDK_DEFAULT:-$(highest_version "$JDK_VERSIONS")}"
   if [ "$RUNNING_UNDER_ROSETTA" -eq 1 ]; then
     log_warn "This shell is running under Rosetta 2. Everything will still be installed natively for $MAC_ARCH, but consider re-running in a native terminal."
   fi
@@ -333,7 +447,25 @@ install_homebrew() {
   elif [ "$DRY_RUN" -eq 1 ]; then
     log_warn "Homebrew is not installed yet, so this dry run cannot check which applications are already present or resolve unknown names."
   fi
-  add_managed_line "eval \"\$($HOMEBREW_PREFIX/bin/brew shellenv)\""
+  PROFILE_CONSIDERED=1
+  if profile_has_brew_shellenv; then
+    log_info "$SHELL_PROFILE already sets up brew shellenv; not adding another copy"
+  else
+    add_managed_line "eval \"\$($HOMEBREW_PREFIX/bin/brew shellenv)\""
+  fi
+}
+
+# True when the login profile already evaluates brew shellenv outside the block
+# this script manages. Homebrew's own installer adds that line, and many people
+# add it by hand, so a second copy would just be noise.
+profile_has_brew_shellenv() {
+  [ -f "$SHELL_PROFILE" ] || return 1
+  awk -v b="# >>> $MANAGED_BLOCK_TAG >>>" -v e="# <<< $MANAGED_BLOCK_TAG <<<" '
+    $0 == b { skip = 1; next }
+    $0 == e { skip = 0; next }
+    !skip && /brew shellenv/ { found = 1 }
+    END { exit(found ? 0 : 1) }
+  ' "$SHELL_PROFILE"
 }
 
 update_homebrew() {
@@ -359,7 +491,12 @@ update_homebrew() {
 # entries piled up on repeat runs.
 # ------------------------------------------------------------------------------
 MANAGED_LINES=()
+MANAGED_RC_LINES=()
+PROFILE_CONSIDERED=0
+RC_CONSIDERED=0
 
+# Append $1 to the named buffer if it is not already there. $2 selects the
+# buffer: "profile" for the login profile, "rc" for the interactive rc file.
 add_managed_line() {
   local line="$1" existing
   for existing in ${MANAGED_LINES[@]+"${MANAGED_LINES[@]}"}; do
@@ -368,63 +505,109 @@ add_managed_line() {
   MANAGED_LINES+=("$line")
 }
 
-set_env_var() {
-  local name="$1" value="$2"
-  [ -n "$value" ] || return 0
-  add_managed_line "export $name=\"$value\""
-  add_managed_line "export PATH=\"\$$name/bin:\$PATH\""
-  # Make it available to the rest of this run too.
-  export "$name=$value"
+add_managed_rc_line() {
+  local line="$1" existing
+  for existing in ${MANAGED_RC_LINES[@]+"${MANAGED_RC_LINES[@]}"}; do
+    [ "$existing" = "$line" ] && return 0
+  done
+  MANAGED_RC_LINES+=("$line")
 }
 
-write_shell_profile() {
-  [ "${#MANAGED_LINES[@]}" -gt 0 ] || return 0
+# Write a managed block into $1, replacing any previous block carrying marker
+# $2. The remaining arguments are the lines of the block.
+write_managed_block() {
+  local file="$1" tag="$2"
+  shift 2
 
-  log_step "Shell profile"
+  local begin="# >>> $tag >>>"
+  local end="# <<< $tag <<<"
 
-  local begin="# >>> $MANAGED_BLOCK_TAG >>>"
-  local end="# <<< $MANAGED_BLOCK_TAG <<<"
-
-  if [ "$DRY_RUN" -eq 1 ]; then
-    printf '%s\n' "${C_YELLOW}[DRY ]${C_RESET}  would write this block to $SHELL_PROFILE:"
+  # No lines means the block is no longer needed. Strip a previous one if it is
+  # there, otherwise there is nothing to do. Leaving a stale block behind would
+  # keep re-applying settings this run decided against.
+  if [ "$#" -eq 0 ]; then
+    [ -f "$file" ] || return 0
+    grep -qxF "$begin" "$file" 2>/dev/null || return 0
+    if [ "$DRY_RUN" -eq 1 ]; then
+      printf '%s\n' "${C_YELLOW}[DRY ]${C_RESET}  would remove the now-empty $tag block from $file"
+      return 0
+    fi
+  elif [ "$DRY_RUN" -eq 1 ]; then
+    printf '%s\n' "${C_YELLOW}[DRY ]${C_RESET}  would write this block to $file:"
     printf '  %s\n' "$begin"
-    printf '  %s\n' ${MANAGED_LINES[@]+"${MANAGED_LINES[@]}"}
+    printf '  %s\n' "$@"
     printf '  %s\n' "$end"
     return 0
   fi
 
-  touch "$SHELL_PROFILE" || { log_warn "Cannot write $SHELL_PROFILE"; return 1; }
+  touch "$file" || { log_warn "Cannot write $file"; return 1; }
 
-  # Stage the rewrite next to the profile so the final mv is atomic and cannot
+  # Stage the rewrite next to the target so the final mv is atomic and cannot
   # cross a filesystem boundary, and carry the original file mode over so the
-  # profile does not silently become mktemp's 0600.
+  # file does not silently become mktemp's 0600.
   local tmp mode
-  tmp="$(mktemp "$(dirname "$SHELL_PROFILE")/.${MANAGED_BLOCK_TAG}.XXXXXX")" || return 1
-  mode="$(stat -f '%Lp' "$SHELL_PROFILE" 2>/dev/null)"
+  tmp="$(mktemp "$(dirname "$file")/.${MANAGED_BLOCK_TAG}.XXXXXX")" || return 1
+  mode="$(stat -f '%Lp' "$file" 2>/dev/null)"
 
-  # Copy the profile, dropping any previous managed block.
+  # Copy the file, dropping any previous block with this marker.
   awk -v b="$begin" -v e="$end" '
     $0 == b { skip = 1; next }
     $0 == e { skip = 0; next }
     !skip   { print }
-  ' "$SHELL_PROFILE" > "$tmp"
+  ' "$file" > "$tmp"
 
-  {
-    printf '%s\n' "$begin"
-    printf '# Managed by %s - edits inside this block are overwritten.\n' "$SCRIPT_NAME"
-    printf '%s\n' ${MANAGED_LINES[@]+"${MANAGED_LINES[@]}"}
-    printf '%s\n' "$end"
-  } >> "$tmp"
+  if [ "$#" -gt 0 ]; then
+    {
+      printf '%s\n' "$begin"
+      printf '# Managed by %s - edits inside this block are overwritten.\n' "$SCRIPT_NAME"
+      printf '%s\n' "$@"
+      printf '%s\n' "$end"
+    } >> "$tmp"
+  fi
 
   [ -n "$mode" ] && chmod "$mode" "$tmp"
 
-  if mv "$tmp" "$SHELL_PROFILE"; then
-    log_ok "Updated $SHELL_PROFILE (${#MANAGED_LINES[@]} managed lines)"
-    log_info "Run 'source $SHELL_PROFILE' or open a new terminal to pick up the changes"
-  else
-    rm -f "$tmp"
-    log_warn "Could not update $SHELL_PROFILE"
-    return 1
+  if mv "$tmp" "$file"; then
+    if [ "$#" -gt 0 ]; then
+      log_ok "Updated $file ($# managed lines)"
+    else
+      log_ok "Removed the now-empty $tag block from $file"
+    fi
+    return 0
+  fi
+  rm -f "$tmp"
+  log_warn "Could not update $file"
+  return 1
+}
+
+# True when write_managed_block would actually change $1: there are lines to
+# write, or a previous block of ours is present and now needs removing.
+block_needs_work() {
+  local file="$1" tag="$2" count="$3"
+  [ "$count" -gt 0 ] && return 0
+  [ -f "$file" ] || return 1
+  grep -qxF "# >>> $tag >>>" "$file" 2>/dev/null
+}
+
+write_shell_files() {
+  local wrote=0
+
+  if [ "$PROFILE_CONSIDERED" -eq 1 ] \
+     && block_needs_work "$SHELL_PROFILE" "$MANAGED_BLOCK_TAG" "${#MANAGED_LINES[@]}"; then
+    log_step "Shell profile"
+    write_managed_block "$SHELL_PROFILE" "$MANAGED_BLOCK_TAG" \
+      ${MANAGED_LINES[@]+"${MANAGED_LINES[@]}"} && wrote=1
+  fi
+
+  if [ "$RC_CONSIDERED" -eq 1 ] \
+     && block_needs_work "$SHELL_RC" "$MANAGED_RC_TAG" "${#MANAGED_RC_LINES[@]}"; then
+    log_step "Shell rc file"
+    write_managed_block "$SHELL_RC" "$MANAGED_RC_TAG" \
+      ${MANAGED_RC_LINES[@]+"${MANAGED_RC_LINES[@]}"} && wrote=1
+  fi
+
+  if [ "$wrote" -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
+    log_info "Open a new terminal, or run 'exec $(basename "$SHELL") -l', to pick up the changes"
   fi
 }
 
@@ -541,142 +724,480 @@ brew_install_auto() {
 # Echoes "<kind> <token>" where kind is formula, cask, custom or auto.
 resolve_app() {
   case "$1" in
+    # Explicit prefixes, for anything the table below does not cover.
+    sdk:*)              echo "sdkman ${1#sdk:}" ;;
+    brew:*)             echo "formula ${1#brew:}" ;;
+    cask:*)             echo "cask ${1#cask:}" ;;
+
     code|vscode)        echo "cask visual-studio-code" ;;
     idea|intellij)      echo "cask intellij-idea" ;;
     sublime|sublimetext) echo "cask sublime-text" ;;
     iterm|iterm2)       echo "cask iterm2" ;;
-    java|jdk)           echo "custom java" ;;
-    maven|mvn)          echo "custom maven" ;;
-    gradle)             echo "custom gradle" ;;
-    scala)              echo "custom scala" ;;
-    sbt)                echo "formula sbt" ;;
     mysql)              echo "custom mysql" ;;
+
+    # Java is special: several JDKs at once, with a vendor per architecture.
+    java|jdk)           echo "custom java" ;;
+
+    # The rest of the JVM toolchain, all SDKMAN candidates.
+    maven|mvn)          echo "sdkman maven" ;;
+    mvnd)               echo "sdkman mvnd" ;;
+    gradle)             echo "sdkman gradle" ;;
+    scala)              echo "sdkman scala" ;;
+    scalacli|scala-cli) echo "sdkman scalacli" ;;
+    sbt)                echo "sdkman sbt" ;;
+    kotlin)             echo "sdkman kotlin" ;;
+    groovy)             echo "sdkman groovy" ;;
+    ant)                echo "sdkman ant" ;;
+    leiningen|lein)     echo "sdkman leiningen" ;;
+    jbang)              echo "sdkman jbang" ;;
+
+    # Data and streaming engines.
+    spark)              echo "sdkman spark" ;;
+    flink)              echo "sdkman flink" ;;
+    hadoop)             echo "sdkman hadoop" ;;
+
+    # Frameworks and JVM tooling.
+    springboot|spring)  echo "sdkman springboot" ;;
+    quarkus)            echo "sdkman quarkus" ;;
+    micronaut)          echo "sdkman micronaut" ;;
+    visualvm)           echo "sdkman visualvm" ;;
+    jmc)                echo "sdkman jmc" ;;
+    jmeter)             echo "sdkman jmeter" ;;
+    liquibase)          echo "sdkman liquibase" ;;
+    tomcat)             echo "sdkman tomcat" ;;
+
     *)                  echo "auto $1" ;;
   esac
 }
 
-# Choose a JDK cask that has a native build for this architecture.
+# ------------------------------------------------------------------------------
+# Java, via SDKMAN
 #
-# Verified against the Homebrew cask index: temurin@8 ships only an x64 pkg, so
-# on Apple Silicon it would install an Intel JDK that needs Rosetta. zulu@8 ships
-# a native aarch64 dmg. For 11 and later, temurin publishes aarch64 builds and is
-# used on both architectures.
-jdk_cask_for_arch() {
-  local version="$1"
-  if [ "$version" = "8" ] && [ "$IS_APPLE_SILICON" -eq 1 ]; then
-    echo "zulu@8"
+# SDKMAN is used instead of Homebrew casks so several JDKs can live side by side
+# and be switched per shell (`sdk use java ...`) or globally (`sdk default
+# java ...`). Homebrew casks install one JDK per formula into
+# /Library/Java/JavaVirtualMachines and have no switching story.
+# ------------------------------------------------------------------------------
+
+sdkman_dir() { printf '%s\n' "${SDKMAN_DIR:-$HOME/.sdkman}"; }
+
+sdkman_installed() { [ -s "$(sdkman_dir)/bin/sdkman-init.sh" ]; }
+
+# SDKMAN's own platform token, which decides which builds the API offers.
+sdkman_platform() {
+  if [ "$IS_APPLE_SILICON" -eq 1 ]; then
+    echo "darwinarm64"
   else
-    echo "temurin@$version"
+    echo "darwinx64"
   fi
 }
 
-# `/usr/libexec/java_home` wants "1.8" for Java 8 and the bare feature number
-# from 9 onwards.
-java_home_spec() {
-  if [ "$1" = "8" ]; then echo "1.8"; else echo "$1"; fi
-}
-
-# Feature version of the JDK installed at $1: 8 for 1.8.0_292, 17 for 17.0.15.
-jdk_feature_version() {
-  local version=""
-  if [ -r "$1/release" ]; then
-    version="$(sed -n 's/^JAVA_VERSION="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$1/release" | head -1)"
-  fi
-  if [ -z "$version" ] && [ -x "$1/bin/java" ]; then
-    version="$("$1/bin/java" -version 2>&1 | sed -n 's/.*version "\([^"]*\)".*/\1/p' | head -1)"
-  fi
-  case "$version" in
-    1.8*) echo 8 ;;
-    "")   echo "" ;;
-    *)    echo "${version%%.*}" ;;
-  esac
-}
-
-# JAVA_HOME of an installed JDK matching feature version $1, or empty.
-#
-# `java_home -v N` cannot be trusted on its own: when version N is absent it
-# silently returns the newest installed JDK and exits 0, so `-v 21` answers with
-# a JDK 17 path on a machine that has no JDK 21. The candidate it returns is
-# therefore verified against the JDK's own release metadata.
-find_installed_jdk() {
-  local want="$1" home actual
-  home="$(/usr/libexec/java_home -v "$(java_home_spec "$want")" 2>/dev/null)"
-  [ -n "$home" ] || return 0
-  actual="$(jdk_feature_version "$home")"
-  [ "$actual" = "$want" ] && printf '%s\n' "$home"
-  return 0
-}
-
-install_java() {
-  local existing cask_token
-  existing="$(find_installed_jdk "$JDK_VERSION")"
-
-  if [ -n "$existing" ]; then
-    log_ok "JDK $JDK_VERSION is already installed at $existing"
-    record_skipped "java (jdk $JDK_VERSION)"
-  else
-    cask_token="$(jdk_cask_for_arch "$JDK_VERSION")"
-    log_info "No JDK $JDK_VERSION found; selected $cask_token for $MAC_ARCH"
-    if ! brew_install_cask "$cask_token"; then
-      log_error "Could not install a JDK $JDK_VERSION"
-      return 1
+install_sdkman() {
+  if sdkman_installed; then
+    # Several candidates in one run would otherwise repeat this line.
+    if [ "$SDKMAN_ANNOUNCED" -eq 0 ]; then
+      log_ok "SDKMAN is already installed at $(sdkman_dir)"
+      SDKMAN_ANNOUNCED=1
     fi
-    if [ "$DRY_RUN" -eq 0 ]; then
-      existing="$(find_installed_jdk "$JDK_VERSION")"
-      if [ -z "$existing" ]; then
-        log_warn "$cask_token installed but no JDK $JDK_VERSION is visible to /usr/libexec/java_home; JAVA_HOME was not set"
-        return 1
-      fi
-    fi
+    return 0
   fi
 
-  # Export JAVA_HOME through java_home rather than a literal path so the value
-  # keeps working across JDK patch upgrades, which move the Cellar path.
-  add_managed_line "export JAVA_HOME=\"\$(/usr/libexec/java_home -v $(java_home_spec "$JDK_VERSION"))\""
-  add_managed_line "export PATH=\"\$JAVA_HOME/bin:\$PATH\""
-  [ -n "$existing" ] && export JAVA_HOME="$existing"
-  log_ok "JAVA_HOME -> ${existing:-resolved at shell startup}"
+  log_info "Installing SDKMAN into $(sdkman_dir) ..."
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '%s\n' "${C_YELLOW}[DRY ]${C_RESET}  curl -fsSL $SDKMAN_INSTALL_URL | bash"
+    return 0
+  fi
+
+  if ! curl -fsSL "$SDKMAN_INSTALL_URL" | bash; then
+    log_error "SDKMAN installation failed"
+    return 1
+  fi
+  if ! sdkman_installed; then
+    log_error "SDKMAN ran but $(sdkman_dir)/bin/sdkman-init.sh is missing"
+    return 1
+  fi
+  log_ok "SDKMAN is installed at $(sdkman_dir)"
+  SDKMAN_ANNOUNCED=1
 }
 
-# Home directory of a Homebrew-installed tool: the directory that holds bin/.
+# Load SDKMAN into this shell so the `sdk` function exists.
 #
-# Homebrew keeps most JVM tools under <prefix>/libexec and links only wrapper
-# scripts into <prefix>/bin, but the layout is not uniform across formulae, so
-# both candidates are probed instead of assumed. `brew --prefix <formula>` is
-# used rather than a hardcoded Cellar path, so this resolves correctly under
-# both /opt/homebrew and /usr/local, and the opt path it returns stays valid
-# across version upgrades.
-brew_tool_home() {
-  local prefix candidate
-  prefix="$(brew --prefix "$1" 2>/dev/null)"
-  [ -n "$prefix" ] || return 1
-  for candidate in "$prefix/libexec" "$prefix"; do
-    if [ -d "$candidate/bin" ]; then
-      printf '%s\n' "$candidate"
+# sdkman-init.sh reads variables that it does not define first, so it aborts
+# under `set -u` with "SDKMAN_CANDIDATES_API: unbound variable". Nounset is
+# lifted around the source and restored afterwards.
+sdkman_load() {
+  sdkman_installed || return 1
+  local dir
+  dir="$(sdkman_dir)"
+  export SDKMAN_DIR="$dir"
+  set +u
+  # shellcheck disable=SC1091
+  . "$SDKMAN_DIR/bin/sdkman-init.sh"
+  set -u
+  command -v sdk >/dev/null 2>&1
+}
+
+# Cache SDKMAN's remote java list for this platform. Called from the main shell,
+# never a subshell, so the cache path survives.
+sdkman_fetch_java_list() {
+  [ -n "$SDKMAN_JAVA_LIST_FILE" ] && [ -s "$SDKMAN_JAVA_LIST_FILE" ] && return 0
+  [ -n "$SDKMAN_JAVA_LIST_FILE" ] && rm -f "$SDKMAN_JAVA_LIST_FILE"
+  SDKMAN_JAVA_LIST_FILE="$(mktemp "${TMPDIR:-/tmp}/${MANAGED_BLOCK_TAG}-java.XXXXXX")" || return 1
+  curl -fsSL "$SDKMAN_API_URL/candidates/java/$(sdkman_platform)/versions/list?installed=" \
+    > "$SDKMAN_JAVA_LIST_FILE" 2>/dev/null
+  [ -s "$SDKMAN_JAVA_LIST_FILE" ]
+}
+
+# The Identifier column of the remote list, one identifier per line.
+sdkman_java_identifiers() {
+  [ -s "$SDKMAN_JAVA_LIST_FILE" ] || return 1
+  awk -F'|' '
+    NF >= 4 {
+      id = $NF
+      gsub(/[ \t]/, "", id)
+      if (id != "" && id != "Identifier") print id
+    }
+  ' "$SDKMAN_JAVA_LIST_FILE"
+}
+
+# Identifiers from the preferred vendors, excluding JavaFX bundles.
+#
+# The full remote list mixes real JDK feature versions with product versions
+# from other tools, so it cannot be read naively. Liberica NIK, for instance,
+# publishes "23.1.12-fx+1.1.r21-nik", which is NIK 23.1 built on Java 21 and
+# not a Java 23 at all. Restricting to the preferred vendors keeps the numbers
+# meaningful, and dropping "fx" identifiers avoids picking a JavaFX bundle when
+# a plain JDK was asked for.
+sdkman_java_candidates() {
+  local vendor_re
+  vendor_re="$(printf '%s' "$SDKMAN_JAVA_VENDORS" | tr ' ' '|')"
+  sdkman_java_identifiers | grep -Ev 'fx' | grep -E -- "-(${vendor_re})$"
+}
+
+# Feature versions SDKMAN can actually install on this platform.
+sdkman_available_majors() {
+  sdkman_java_candidates | sed 's/[.+-].*//' | grep -E '^[0-9]+$' | sort -un | tr '\n' ' '
+}
+
+# Newest identifier for feature version $1, honouring SDKMAN_JAVA_VENDORS.
+#
+# Identifiers are matched anchored at the start so that asking for 21 cannot
+# match 8.0.21, and `sort -V` then picks the highest patch release.
+sdkman_resolve_java() {
+  local major="$1" vendor id
+  for vendor in $SDKMAN_JAVA_VENDORS; do
+    id="$(sdkman_java_candidates \
+          | grep -E "^${major}([.+-]|$)" \
+          | grep -E -- "-${vendor}$" \
+          | sort -V | tail -1)"
+    if [ -n "$id" ]; then
+      printf '%s\n' "$id"
       return 0
     fi
   done
   return 1
 }
 
-# Install a formula and publish its home directory as $2.
-install_formula_with_home() {
-  local formula="$1" var_name="$2" home
-  brew_install_formula "$formula" || return 1
-  [ "$DRY_RUN" -eq 1 ] && return 0
+# True when the startup files this shell actually reads already source SDKMAN's
+# init, ignoring the block this script manages.
+#
+# SDKMAN's own installer appends that snippet to ~/.zshrc and, on macOS, to
+# ~/.bash_profile. Only the files the current shell reads count: a snippet in
+# ~/.bash_profile does nothing for a zsh user, which is exactly how a machine
+# ends up with SDKMAN installed but no working `sdk` command.
+shell_files_have_sdkman_init() {
+  local file
+  for file in "$SHELL_RC" "$SHELL_PROFILE"; do
+    [ -f "$file" ] || continue
+    awk -v b="# >>> $MANAGED_RC_TAG >>>" -v e="# <<< $MANAGED_RC_TAG <<<" '
+      $0 == b { skip = 1; next }
+      $0 == e { skip = 0; next }
+      !skip && /sdkman-init\.sh/ { found = 1 }
+      END { exit(found ? 0 : 1) }
+    ' "$file" && return 0
+  done
+  return 1
+}
 
-  home="$(brew_tool_home "$formula")"
-  if [ -n "$home" ]; then
-    set_env_var "$var_name" "$home"
-    log_ok "$var_name -> $home"
+# ------------------------------------------------------------------------------
+# SDKMAN candidates other than Java
+#
+# SDKMAN carries most of the JVM toolchain, and the same argument that applies
+# to JDKs applies to these: several versions can be installed side by side and
+# switched per shell, which Homebrew cannot do. It matters in practice for
+# Scala and Spark, where the version is dictated by the project rather than by
+# what happens to be newest.
+#
+# Unlike java, these candidates take no vendor: `sdk install <candidate>`
+# installs SDKMAN's default version, and an explicit version is validated
+# against the API before use.
+# ------------------------------------------------------------------------------
+
+# Comma-separated list of every SDKMAN candidate, fetched once.
+sdkman_candidate_list() {
+  if [ -z "$SDKMAN_CANDIDATE_LIST" ]; then
+    SDKMAN_CANDIDATE_LIST="$(curl -fsSL "$SDKMAN_API_URL/candidates/all" 2>/dev/null)"
+  fi
+  printf '%s\n' "$SDKMAN_CANDIDATE_LIST"
+}
+
+sdkman_is_candidate() {
+  local name="$1" candidate
+  for candidate in $(sdkman_candidate_list | tr ',' ' '); do
+    [ "$candidate" = "$name" ] && return 0
+  done
+  return 1
+}
+
+sdkman_candidate_default_version() {
+  curl -fsSL "$SDKMAN_API_URL/candidates/default/$1" 2>/dev/null
+}
+
+# The API answers "valid" or "invalid" for a candidate/version/platform triple.
+sdkman_version_is_valid() {
+  local reply
+  reply="$(curl -fsSL "$SDKMAN_API_URL/candidates/validate/$1/$2/$(sdkman_platform)" 2>/dev/null)"
+  [ "$reply" = "valid" ]
+}
+
+# Any version of $1 already installed?
+sdkman_candidate_has_any_version() {
+  local dir entry
+  dir="$(sdkman_dir)/candidates/$1"
+  [ -d "$dir" ] || return 1
+  for entry in "$dir"/*; do
+    [ -d "$entry" ] || continue
+    [ "$(basename "$entry")" = "current" ] && continue
+    return 0
+  done
+  return 1
+}
+
+# Install an SDKMAN candidate. $1 is the candidate, $2 an optional version.
+install_sdkman_candidate() {
+  local candidate="$1" version="${2:-}" label rc
+
+  install_sdkman || { record_failed "$candidate (sdkman)"; return 1; }
+  publish_sdkman_init
+
+  if [ "$DRY_RUN" -eq 0 ] && ! sdkman_load; then
+    log_error "SDKMAN is installed but could not be loaded; skipping $candidate"
+    record_failed "$candidate (sdkman)"
+    return 1
+  fi
+
+  if ! sdkman_is_candidate "$candidate"; then
+    log_error "$candidate is not an SDKMAN candidate. See 'sdk list' for the full set."
+    record_failed "$candidate"
+    return 1
+  fi
+
+  if [ -n "$version" ]; then
+    if ! sdkman_version_is_valid "$candidate" "$version"; then
+      log_error "$candidate $version is not available for $(sdkman_platform)"
+      record_failed "$candidate $version"
+      return 1
+    fi
+    label="$candidate $version"
+    if [ -d "$(sdkman_dir)/candidates/$candidate/$version" ]; then
+      log_ok "$label is already installed"
+      record_skipped "$label"
+      return 0
+    fi
   else
-    log_warn "Installed $formula but could not locate its home directory; $var_name was not set"
+    version="$(sdkman_candidate_default_version "$candidate")"
+    label="$candidate${version:+ $version}"
+    if sdkman_candidate_has_any_version "$candidate"; then
+      log_ok "$candidate is already installed ($(readlink "$(sdkman_dir)/candidates/$candidate/current" 2>/dev/null | xargs basename 2>/dev/null || echo 'a version is present'))"
+      record_skipped "$candidate"
+      return 0
+    fi
+  fi
+
+  log_info "Installing $label via SDKMAN ..."
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '%s\n' "${C_YELLOW}[DRY ]${C_RESET}  sdk install $candidate $version"
+    record_installed "$label"
+    return 0
+  fi
+
+  set +u
+  # Same stdin answer as for JDKs: never let an install silently reassign the
+  # default for a candidate that already has one.
+  printf 'n\n' | sdk install "$candidate" "$version"
+  rc=$?
+  set -u
+
+  if [ "$rc" -ne 0 ] || ! sdkman_candidate_has_any_version "$candidate"; then
+    log_error "Failed to install $label"
+    record_failed "$label"
+    return 1
+  fi
+
+  log_ok "$label is installed"
+  record_installed "$label"
+
+  # Maven is the one candidate with a legacy second name. SDKMAN exports
+  # MAVEN_HOME; a lot of older tooling still reads M2_HOME, so mirror it.
+  if [ "$candidate" = "maven" ]; then
+    # shellcheck disable=SC2016  # stays literal on purpose: it expands at shell startup
+    add_managed_rc_line 'export M2_HOME="${MAVEN_HOME:-$SDKMAN_DIR/candidates/maven/current}"'
   fi
 }
 
-install_maven()  { install_formula_with_home maven M2_HOME; }
-install_gradle() { install_formula_with_home gradle GRADLE_HOME; }
-install_scala()  { install_formula_with_home "scala@2.12" SCALA_HOME; }
+# Make `sdk` available in future shells, unless something already does.
+publish_sdkman_init() {
+  RC_CONSIDERED=1
+  if shell_files_have_sdkman_init; then
+    log_info "SDKMAN init is already in your shell startup files; not adding another copy"
+    return 0
+  fi
+  add_managed_rc_line "export SDKMAN_DIR=\"$(sdkman_dir)\""
+  add_managed_rc_line "[ -s \"\$SDKMAN_DIR/bin/sdkman-init.sh\" ] && . \"\$SDKMAN_DIR/bin/sdkman-init.sh\""
+}
+
+java_installed_via_sdkman() { [ -d "$(sdkman_dir)/candidates/java/$1" ]; }
+
+# An already-installed SDKMAN build for feature version $1, or empty. Reusing
+# what is present avoids re-downloading a whole JDK only because a newer patch
+# release has since appeared.
+sdkman_installed_java_for_major() {
+  local major="$1" dir entry name
+  dir="$(sdkman_dir)/candidates/java"
+  [ -d "$dir" ] || return 0
+  for entry in "$dir"/*; do
+    [ -d "$entry" ] || continue
+    name="$(basename "$entry")"
+    # `current` is SDKMAN's symlink to the default, not a version of its own.
+    [ "$name" = "current" ] && continue
+    case "$name" in
+      "$major"|"$major".*|"$major"+*|"$major"-*) printf '%s\n' "$name" ;;
+    esac
+  done | sort -V | tail -1
+}
+
+# Install one JDK without letting it take over as the default.
+#
+# `sdk install` asks "Do you want java X to be set as default? (Y/n)" whenever a
+# default already exists, which would otherwise prompt once per JDK and let the
+# last install decide the default.
+#
+# Setting sdkman_auto_answer as a prefix assignment does not work here: the
+# `sdk` wrapper re-sources $SDKMAN_DIR/etc/config on every invocation
+# (sdkman-main.sh), which resets sdkman_auto_answer to its configured value
+# before the prompt is reached. SDKMAN's own sdkman-env.sh gets away with it
+# only because it calls the private __sdk_install directly and bypasses that
+# wrapper. Answering "n" on stdin needs no private functions and no edit to the
+# user's config, and --jdk-default is then applied explicitly afterwards.
+sdkman_install_java() {
+  local identifier="$1" major="$2" rc
+
+  if java_installed_via_sdkman "$identifier"; then
+    log_ok "Java $major ($identifier) is already installed"
+    record_skipped "java $major"
+    return 0
+  fi
+
+  log_info "Installing Java $major ($identifier) ..."
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '%s\n' "${C_YELLOW}[DRY ]${C_RESET}  sdk install java $identifier"
+    record_installed "java $major"
+    return 0
+  fi
+
+  set +u
+  printf 'n\n' | sdk install java "$identifier"
+  rc=$?
+  set -u
+
+  if [ "$rc" -ne 0 ] || ! java_installed_via_sdkman "$identifier"; then
+    log_error "Failed to install Java $major ($identifier)"
+    record_failed "java $major"
+    return 1
+  fi
+  log_ok "Java $major ($identifier) is installed"
+  record_installed "java $major"
+}
+
+# Highest feature version in a comma or space separated list.
+highest_version() {
+  printf '%s\n' "$1" | tr ',' '\n' | grep -E '^[0-9]+$' | sort -n | tail -1
+}
+
+install_java() {
+  local majors major identifier default_identifier="" default_major="" rc
+
+  install_sdkman || { record_failed "java (sdkman)"; return 1; }
+
+  # `sdk` is a shell function, so it must be defined in every interactive
+  # shell, not just login shells. SDKMAN's own installer adds this to the rc
+  # file too; the guard makes a duplicate harmless.
+  publish_sdkman_init
+
+  if [ "$DRY_RUN" -eq 0 ] && ! sdkman_load; then
+    log_error "SDKMAN is installed but could not be loaded; skipping Java"
+    record_failed "java (sdkman)"
+    return 1
+  fi
+
+  if ! sdkman_fetch_java_list; then
+    log_error "Could not reach the SDKMAN API to list available JDKs"
+    record_failed "java"
+    return 1
+  fi
+
+  majors="$(printf '%s' "$JDK_VERSIONS" | tr ',' ' ')"
+  default_major="${JDK_DEFAULT:-$(highest_version "$JDK_VERSIONS")}"
+
+  log_info "SDKMAN platform $(sdkman_platform); available Java versions: $(sdkman_available_majors)"
+
+  for major in $majors; do
+    identifier="$(sdkman_installed_java_for_major "$major")"
+
+    if [ -n "$identifier" ]; then
+      log_ok "Java $major ($identifier) is already installed"
+      record_skipped "java $major"
+    else
+      identifier="$(sdkman_resolve_java "$major")"
+      if [ -z "$identifier" ]; then
+        # Java 22 lands here. It was a non-LTS release, now past end of life,
+        # and no vendor still publishes it, so it cannot be installed even
+        # though older guides and blog posts still mention it.
+        log_error "No Java $major build is available for $(sdkman_platform). Available: $(sdkman_available_majors)"
+        record_failed "java $major"
+        continue
+      fi
+      sdkman_install_java "$identifier" "$major" || continue
+    fi
+
+    [ "$major" = "$default_major" ] && default_identifier="$identifier"
+  done
+
+  # SDKMAN exports JAVA_HOME itself, pointing at the stable
+  # candidates/java/current symlink, so the script must not export it too.
+  if [ -n "$default_identifier" ]; then
+    log_info "Setting Java $default_major ($default_identifier) as the default ..."
+    if [ "$DRY_RUN" -eq 1 ]; then
+      printf '%s\n' "${C_YELLOW}[DRY ]${C_RESET}  sdk default java $default_identifier"
+    else
+      set +u
+      sdk default java "$default_identifier"
+      rc=$?
+      set -u
+      if [ "$rc" -eq 0 ]; then
+        log_ok "Default Java is now $default_major ($default_identifier)"
+      else
+        log_warn "Could not set Java $default_major as the default"
+      fi
+    fi
+  elif [ -n "$default_major" ]; then
+    log_warn "Java $default_major was requested as the default but is not installed; the default is unchanged"
+  fi
+
+  log_info "Switch for this shell only : sdk use java <identifier>"
+  log_info "Change the default         : sdk default java <identifier>"
+  log_info "See what is installed      : sdk list java"
+}
 
 install_mysql() {
   brew_install_formula mysql || return 1
@@ -710,12 +1231,17 @@ install_app() {
     formula) brew_install_formula "$token" ;;
     cask)    brew_install_cask "$token" ;;
     auto)    brew_install_auto "$token" ;;
+    sdkman)
+      # "candidate@version" pins a version; bare "candidate" takes SDKMAN's
+      # default. Pinning matters for Scala and Spark, where the project decides.
+      case "$token" in
+        *@*) install_sdkman_candidate "${token%%@*}" "${token#*@}" ;;
+        *)   install_sdkman_candidate "$token" ;;
+      esac
+      ;;
     custom)
       case "$token" in
         java)   install_java ;;
-        maven)  install_maven ;;
-        gradle) install_gradle ;;
-        scala)  install_scala ;;
         mysql)  install_mysql ;;
         *)      log_error "No handler for custom app '$token'"; record_failed "$app"; return 1 ;;
       esac
@@ -764,7 +1290,7 @@ print_summary() {
 show_lists() {
   detect_architecture
   detect_homebrew_prefix >/dev/null 2>&1 || true
-  detect_shell_profile
+  detect_shell_files
   print_system_summary
   log_step "Basic applications"
   printf '  %s\n' "${BASIC_APPS_LIST[*]}"
@@ -806,7 +1332,7 @@ main() {
   check_not_root
   detect_architecture
   detect_homebrew_prefix >/dev/null 2>&1 || true
-  detect_shell_profile
+  detect_shell_files
   print_system_summary
   confirm
 
@@ -821,7 +1347,7 @@ main() {
     [ "$DO_ADVANCED" -eq 1 ] && install_app_list "Advanced applications" "${ADVANCED_APPS_LIST[@]}"
   fi
 
-  write_shell_profile
+  write_shell_files
   print_summary
 }
 
