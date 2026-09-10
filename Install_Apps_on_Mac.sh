@@ -63,6 +63,8 @@ BREW_BIN=""
 SHELL_PROFILE=""
 SHELL_RC=""
 SDKMAN_JAVA_LIST_FILE=""
+SDKMAN_CANDIDATE_LIST=""
+SDKMAN_ANNOUNCED=0
 
 DRY_RUN=0
 LIST_ONLY=0
@@ -140,18 +142,49 @@ ${C_BOLD}OPTIONS${C_RESET}
 
 ${C_BOLD}APP${C_RESET}
   One or more application names to install instead of the default lists. An
-  alias from the table below, or any Homebrew formula or cask token; the script
-  resolves formula first, then cask.
+  alias from the table below, or any Homebrew formula or cask token; unknown
+  names resolve as a Homebrew formula first, then a cask.
+
+  Prefixes force a particular installer:
+    sdk:<candidate>[@<version>]   an SDKMAN candidate, optionally pinned
+    brew:<formula>                a Homebrew formula
+    cask:<token>                  a Homebrew cask
 
 ${C_BOLD}ALIASES${C_RESET}
-  code, vscode      -> visual-studio-code (cask)
-  idea, intellij    -> intellij-idea (cask)
-  sublime           -> sublime-text (cask)
-  java, jdk         -> SDKMAN plus the JDKs in --jdk-versions
-  maven, mvn        -> maven + M2_HOME
-  gradle            -> gradle + GRADLE_HOME
-  scala             -> scala@2.12 + SCALA_HOME
-  mysql             -> mysql server + MySQL Workbench
+  Homebrew casks:
+    code, vscode    -> visual-studio-code
+    idea, intellij  -> intellij-idea
+    sublime         -> sublime-text
+    iterm, iterm2   -> iterm2
+    mysql           -> mysql server + MySQL Workbench
+
+  SDKMAN, so several versions coexist and can be switched:
+    java, jdk       -> the JDKs in --jdk-versions
+    maven, mvn      -> maven (also mirrors MAVEN_HOME to M2_HOME)
+    mvnd            -> the Maven daemon
+    gradle          -> gradle
+    scala           -> scala
+    scalacli        -> scala-cli
+    sbt             -> sbt
+    kotlin          -> kotlin
+    groovy          -> groovy
+    ant             -> ant
+    leiningen, lein -> leiningen
+    jbang           -> jbang
+    spark           -> Apache Spark
+    flink           -> Apache Flink
+    hadoop          -> Apache Hadoop
+    springboot      -> Spring Boot CLI
+    quarkus         -> Quarkus CLI
+    micronaut       -> Micronaut CLI
+    visualvm        -> VisualVM
+    jmc             -> JDK Mission Control
+    jmeter          -> Apache JMeter
+    liquibase       -> Liquibase
+    tomcat          -> Apache Tomcat
+
+  'sdk list' shows every candidate SDKMAN offers, not just these aliases; reach
+  any of them with the sdk: prefix.
 
 ${C_BOLD}EXAMPLES${C_RESET}
   $SCRIPT_NAME                          # install everything
@@ -161,13 +194,22 @@ ${C_BOLD}EXAMPLES${C_RESET}
   $SCRIPT_NAME -j 11,17,21 java         # three JDKs, newest as default
   $SCRIPT_NAME --jdk-default 17 java    # install the list, default to 17
   $SCRIPT_NAME docker rectangle         # arbitrary casks
+  $SCRIPT_NAME spark flink              # Spark and Flink via SDKMAN
+  $SCRIPT_NAME sdk:scala@2.13.13        # a pinned Scala, as a Spark build needs
+  $SCRIPT_NAME sdk:quarkus              # any SDKMAN candidate, by name
+  $SCRIPT_NAME brew:ripgrep             # force the Homebrew formula
 
-${C_BOLD}JAVA${C_RESET}
-  Java is installed with SDKMAN so several JDKs can coexist and be switched:
+${C_BOLD}JVM TOOLCHAIN${C_RESET}
+  Java and the rest of the JVM toolchain are installed with SDKMAN so several
+  versions can coexist and be switched:
 
     sdk list java                 show installed and available builds
     sdk use java 17.0.20-tem      switch this shell only
     sdk default java 21.0.12-tem  change the default for new shells
+    sdk use scala 2.13.13         the same works for every candidate
+
+  SDKMAN exports <CANDIDATE>_HOME for whatever is current, so JAVA_HOME,
+  MAVEN_HOME, SPARK_HOME and the rest are set for you.
 
   Vendors are tried in this order: $SDKMAN_JAVA_VENDORS. That order matters on
   Apple Silicon, where Temurin has no macOS aarch64 build for Java 8 and Zulu
@@ -471,15 +513,6 @@ add_managed_rc_line() {
   MANAGED_RC_LINES+=("$line")
 }
 
-set_env_var() {
-  local name="$1" value="$2"
-  [ -n "$value" ] || return 0
-  add_managed_line "export $name=\"$value\""
-  add_managed_line "export PATH=\"\$$name/bin:\$PATH\""
-  # Make it available to the rest of this run too.
-  export "$name=$value"
-}
-
 # Write a managed block into $1, replacing any previous block carrying marker
 # $2. The remaining arguments are the lines of the block.
 write_managed_block() {
@@ -547,16 +580,27 @@ write_managed_block() {
   return 1
 }
 
+# True when write_managed_block would actually change $1: there are lines to
+# write, or a previous block of ours is present and now needs removing.
+block_needs_work() {
+  local file="$1" tag="$2" count="$3"
+  [ "$count" -gt 0 ] && return 0
+  [ -f "$file" ] || return 1
+  grep -qxF "# >>> $tag >>>" "$file" 2>/dev/null
+}
+
 write_shell_files() {
   local wrote=0
 
-  if [ "$PROFILE_CONSIDERED" -eq 1 ]; then
+  if [ "$PROFILE_CONSIDERED" -eq 1 ] \
+     && block_needs_work "$SHELL_PROFILE" "$MANAGED_BLOCK_TAG" "${#MANAGED_LINES[@]}"; then
     log_step "Shell profile"
     write_managed_block "$SHELL_PROFILE" "$MANAGED_BLOCK_TAG" \
       ${MANAGED_LINES[@]+"${MANAGED_LINES[@]}"} && wrote=1
   fi
 
-  if [ "$RC_CONSIDERED" -eq 1 ]; then
+  if [ "$RC_CONSIDERED" -eq 1 ] \
+     && block_needs_work "$SHELL_RC" "$MANAGED_RC_TAG" "${#MANAGED_RC_LINES[@]}"; then
     log_step "Shell rc file"
     write_managed_block "$SHELL_RC" "$MANAGED_RC_TAG" \
       ${MANAGED_RC_LINES[@]+"${MANAGED_RC_LINES[@]}"} && wrote=1
@@ -680,16 +724,48 @@ brew_install_auto() {
 # Echoes "<kind> <token>" where kind is formula, cask, custom or auto.
 resolve_app() {
   case "$1" in
+    # Explicit prefixes, for anything the table below does not cover.
+    sdk:*)              echo "sdkman ${1#sdk:}" ;;
+    brew:*)             echo "formula ${1#brew:}" ;;
+    cask:*)             echo "cask ${1#cask:}" ;;
+
     code|vscode)        echo "cask visual-studio-code" ;;
     idea|intellij)      echo "cask intellij-idea" ;;
     sublime|sublimetext) echo "cask sublime-text" ;;
     iterm|iterm2)       echo "cask iterm2" ;;
-    java|jdk)           echo "custom java" ;;
-    maven|mvn)          echo "custom maven" ;;
-    gradle)             echo "custom gradle" ;;
-    scala)              echo "custom scala" ;;
-    sbt)                echo "formula sbt" ;;
     mysql)              echo "custom mysql" ;;
+
+    # Java is special: several JDKs at once, with a vendor per architecture.
+    java|jdk)           echo "custom java" ;;
+
+    # The rest of the JVM toolchain, all SDKMAN candidates.
+    maven|mvn)          echo "sdkman maven" ;;
+    mvnd)               echo "sdkman mvnd" ;;
+    gradle)             echo "sdkman gradle" ;;
+    scala)              echo "sdkman scala" ;;
+    scalacli|scala-cli) echo "sdkman scalacli" ;;
+    sbt)                echo "sdkman sbt" ;;
+    kotlin)             echo "sdkman kotlin" ;;
+    groovy)             echo "sdkman groovy" ;;
+    ant)                echo "sdkman ant" ;;
+    leiningen|lein)     echo "sdkman leiningen" ;;
+    jbang)              echo "sdkman jbang" ;;
+
+    # Data and streaming engines.
+    spark)              echo "sdkman spark" ;;
+    flink)              echo "sdkman flink" ;;
+    hadoop)             echo "sdkman hadoop" ;;
+
+    # Frameworks and JVM tooling.
+    springboot|spring)  echo "sdkman springboot" ;;
+    quarkus)            echo "sdkman quarkus" ;;
+    micronaut)          echo "sdkman micronaut" ;;
+    visualvm)           echo "sdkman visualvm" ;;
+    jmc)                echo "sdkman jmc" ;;
+    jmeter)             echo "sdkman jmeter" ;;
+    liquibase)          echo "sdkman liquibase" ;;
+    tomcat)             echo "sdkman tomcat" ;;
+
     *)                  echo "auto $1" ;;
   esac
 }
@@ -718,7 +794,11 @@ sdkman_platform() {
 
 install_sdkman() {
   if sdkman_installed; then
-    log_ok "SDKMAN is already installed at $(sdkman_dir)"
+    # Several candidates in one run would otherwise repeat this line.
+    if [ "$SDKMAN_ANNOUNCED" -eq 0 ]; then
+      log_ok "SDKMAN is already installed at $(sdkman_dir)"
+      SDKMAN_ANNOUNCED=1
+    fi
     return 0
   fi
 
@@ -737,6 +817,7 @@ install_sdkman() {
     return 1
   fi
   log_ok "SDKMAN is installed at $(sdkman_dir)"
+  SDKMAN_ANNOUNCED=1
 }
 
 # Load SDKMAN into this shell so the `sdk` function exists.
@@ -838,6 +919,143 @@ shell_files_have_sdkman_init() {
   return 1
 }
 
+# ------------------------------------------------------------------------------
+# SDKMAN candidates other than Java
+#
+# SDKMAN carries most of the JVM toolchain, and the same argument that applies
+# to JDKs applies to these: several versions can be installed side by side and
+# switched per shell, which Homebrew cannot do. It matters in practice for
+# Scala and Spark, where the version is dictated by the project rather than by
+# what happens to be newest.
+#
+# Unlike java, these candidates take no vendor: `sdk install <candidate>`
+# installs SDKMAN's default version, and an explicit version is validated
+# against the API before use.
+# ------------------------------------------------------------------------------
+
+# Comma-separated list of every SDKMAN candidate, fetched once.
+sdkman_candidate_list() {
+  if [ -z "$SDKMAN_CANDIDATE_LIST" ]; then
+    SDKMAN_CANDIDATE_LIST="$(curl -fsSL "$SDKMAN_API_URL/candidates/all" 2>/dev/null)"
+  fi
+  printf '%s\n' "$SDKMAN_CANDIDATE_LIST"
+}
+
+sdkman_is_candidate() {
+  local name="$1" candidate
+  for candidate in $(sdkman_candidate_list | tr ',' ' '); do
+    [ "$candidate" = "$name" ] && return 0
+  done
+  return 1
+}
+
+sdkman_candidate_default_version() {
+  curl -fsSL "$SDKMAN_API_URL/candidates/default/$1" 2>/dev/null
+}
+
+# The API answers "valid" or "invalid" for a candidate/version/platform triple.
+sdkman_version_is_valid() {
+  local reply
+  reply="$(curl -fsSL "$SDKMAN_API_URL/candidates/validate/$1/$2/$(sdkman_platform)" 2>/dev/null)"
+  [ "$reply" = "valid" ]
+}
+
+# Any version of $1 already installed?
+sdkman_candidate_has_any_version() {
+  local dir entry
+  dir="$(sdkman_dir)/candidates/$1"
+  [ -d "$dir" ] || return 1
+  for entry in "$dir"/*; do
+    [ -d "$entry" ] || continue
+    [ "$(basename "$entry")" = "current" ] && continue
+    return 0
+  done
+  return 1
+}
+
+# Install an SDKMAN candidate. $1 is the candidate, $2 an optional version.
+install_sdkman_candidate() {
+  local candidate="$1" version="${2:-}" label rc
+
+  install_sdkman || { record_failed "$candidate (sdkman)"; return 1; }
+  publish_sdkman_init
+
+  if [ "$DRY_RUN" -eq 0 ] && ! sdkman_load; then
+    log_error "SDKMAN is installed but could not be loaded; skipping $candidate"
+    record_failed "$candidate (sdkman)"
+    return 1
+  fi
+
+  if ! sdkman_is_candidate "$candidate"; then
+    log_error "$candidate is not an SDKMAN candidate. See 'sdk list' for the full set."
+    record_failed "$candidate"
+    return 1
+  fi
+
+  if [ -n "$version" ]; then
+    if ! sdkman_version_is_valid "$candidate" "$version"; then
+      log_error "$candidate $version is not available for $(sdkman_platform)"
+      record_failed "$candidate $version"
+      return 1
+    fi
+    label="$candidate $version"
+    if [ -d "$(sdkman_dir)/candidates/$candidate/$version" ]; then
+      log_ok "$label is already installed"
+      record_skipped "$label"
+      return 0
+    fi
+  else
+    version="$(sdkman_candidate_default_version "$candidate")"
+    label="$candidate${version:+ $version}"
+    if sdkman_candidate_has_any_version "$candidate"; then
+      log_ok "$candidate is already installed ($(readlink "$(sdkman_dir)/candidates/$candidate/current" 2>/dev/null | xargs basename 2>/dev/null || echo 'a version is present'))"
+      record_skipped "$candidate"
+      return 0
+    fi
+  fi
+
+  log_info "Installing $label via SDKMAN ..."
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '%s\n' "${C_YELLOW}[DRY ]${C_RESET}  sdk install $candidate $version"
+    record_installed "$label"
+    return 0
+  fi
+
+  set +u
+  # Same stdin answer as for JDKs: never let an install silently reassign the
+  # default for a candidate that already has one.
+  printf 'n\n' | sdk install "$candidate" "$version"
+  rc=$?
+  set -u
+
+  if [ "$rc" -ne 0 ] || ! sdkman_candidate_has_any_version "$candidate"; then
+    log_error "Failed to install $label"
+    record_failed "$label"
+    return 1
+  fi
+
+  log_ok "$label is installed"
+  record_installed "$label"
+
+  # Maven is the one candidate with a legacy second name. SDKMAN exports
+  # MAVEN_HOME; a lot of older tooling still reads M2_HOME, so mirror it.
+  if [ "$candidate" = "maven" ]; then
+    # shellcheck disable=SC2016  # stays literal on purpose: it expands at shell startup
+    add_managed_rc_line 'export M2_HOME="${MAVEN_HOME:-$SDKMAN_DIR/candidates/maven/current}"'
+  fi
+}
+
+# Make `sdk` available in future shells, unless something already does.
+publish_sdkman_init() {
+  RC_CONSIDERED=1
+  if shell_files_have_sdkman_init; then
+    log_info "SDKMAN init is already in your shell startup files; not adding another copy"
+    return 0
+  fi
+  add_managed_rc_line "export SDKMAN_DIR=\"$(sdkman_dir)\""
+  add_managed_rc_line "[ -s \"\$SDKMAN_DIR/bin/sdkman-init.sh\" ] && . \"\$SDKMAN_DIR/bin/sdkman-init.sh\""
+}
+
 java_installed_via_sdkman() { [ -d "$(sdkman_dir)/candidates/java/$1" ]; }
 
 # An already-installed SDKMAN build for feature version $1, or empty. Reusing
@@ -914,13 +1132,7 @@ install_java() {
   # `sdk` is a shell function, so it must be defined in every interactive
   # shell, not just login shells. SDKMAN's own installer adds this to the rc
   # file too; the guard makes a duplicate harmless.
-  RC_CONSIDERED=1
-  if shell_files_have_sdkman_init; then
-    log_info "SDKMAN init is already in your shell startup files; not adding another copy"
-  else
-    add_managed_rc_line "export SDKMAN_DIR=\"$(sdkman_dir)\""
-    add_managed_rc_line "[ -s \"\$SDKMAN_DIR/bin/sdkman-init.sh\" ] && . \"\$SDKMAN_DIR/bin/sdkman-init.sh\""
-  fi
+  publish_sdkman_init
 
   if [ "$DRY_RUN" -eq 0 ] && ! sdkman_load; then
     log_error "SDKMAN is installed but could not be loaded; skipping Java"
@@ -987,46 +1199,6 @@ install_java() {
   log_info "See what is installed      : sdk list java"
 }
 
-# Home directory of a Homebrew-installed tool: the directory that holds bin/.
-#
-# Homebrew keeps most JVM tools under <prefix>/libexec and links only wrapper
-# scripts into <prefix>/bin, but the layout is not uniform across formulae, so
-# both candidates are probed instead of assumed. `brew --prefix <formula>` is
-# used rather than a hardcoded Cellar path, so this resolves correctly under
-# both /opt/homebrew and /usr/local, and the opt path it returns stays valid
-# across version upgrades.
-brew_tool_home() {
-  local prefix candidate
-  prefix="$(brew --prefix "$1" 2>/dev/null)"
-  [ -n "$prefix" ] || return 1
-  for candidate in "$prefix/libexec" "$prefix"; do
-    if [ -d "$candidate/bin" ]; then
-      printf '%s\n' "$candidate"
-      return 0
-    fi
-  done
-  return 1
-}
-
-# Install a formula and publish its home directory as $2.
-install_formula_with_home() {
-  local formula="$1" var_name="$2" home
-  brew_install_formula "$formula" || return 1
-  [ "$DRY_RUN" -eq 1 ] && return 0
-
-  home="$(brew_tool_home "$formula")"
-  if [ -n "$home" ]; then
-    set_env_var "$var_name" "$home"
-    log_ok "$var_name -> $home"
-  else
-    log_warn "Installed $formula but could not locate its home directory; $var_name was not set"
-  fi
-}
-
-install_maven()  { install_formula_with_home maven M2_HOME; }
-install_gradle() { install_formula_with_home gradle GRADLE_HOME; }
-install_scala()  { install_formula_with_home "scala@2.12" SCALA_HOME; }
-
 install_mysql() {
   brew_install_formula mysql || return 1
   local server_is_new="$LAST_INSTALL_WAS_NEW"
@@ -1059,12 +1231,17 @@ install_app() {
     formula) brew_install_formula "$token" ;;
     cask)    brew_install_cask "$token" ;;
     auto)    brew_install_auto "$token" ;;
+    sdkman)
+      # "candidate@version" pins a version; bare "candidate" takes SDKMAN's
+      # default. Pinning matters for Scala and Spark, where the project decides.
+      case "$token" in
+        *@*) install_sdkman_candidate "${token%%@*}" "${token#*@}" ;;
+        *)   install_sdkman_candidate "$token" ;;
+      esac
+      ;;
     custom)
       case "$token" in
         java)   install_java ;;
-        maven)  install_maven ;;
-        gradle) install_gradle ;;
-        scala)  install_scala ;;
         mysql)  install_mysql ;;
         *)      log_error "No handler for custom app '$token'"; record_failed "$app"; return 1 ;;
       esac

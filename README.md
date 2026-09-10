@@ -16,7 +16,7 @@ It is safe to re-run. Anything already installed is reported and skipped.
 ## Requirements
 
 * macOS on Apple Silicon or Intel
-* `curl` and `unzip`, both preinstalled on macOS (SDKMAN needs them)
+* `curl`, `unzip` and `zip`, all preinstalled on macOS (SDKMAN needs them)
 * An administrator account (Homebrew and some casks ask for your password)
 * Xcode Command Line Tools (the script installs them if missing)
 
@@ -81,17 +81,50 @@ token**. Unknown names are resolved against Homebrew at run time (formula first,
 then cask), so you can add `docker`, `postgresql@16`, `rectangle` and so on
 without touching any other part of the script.
 
-| Alias | Installs | Also sets |
+| Alias | Installer | Notes |
 | --- | --- | --- |
-| `code`, `vscode` | `visual-studio-code` | |
-| `idea`, `intellij` | `intellij-idea` | |
-| `sublime` | `sublime-text` | |
-| `iterm`, `iterm2` | `iterm2` | |
-| `java`, `jdk` | SDKMAN plus the JDKs in `--jdk-versions` | `JAVA_HOME` (by SDKMAN) |
-| `maven`, `mvn` | `maven` | `M2_HOME` |
-| `gradle` | `gradle` | `GRADLE_HOME` |
-| `scala` | `scala@2.12` | `SCALA_HOME` |
-| `mysql` | `mysql` server + MySQL Workbench | |
+| `code`, `vscode` | cask | Visual Studio Code |
+| `idea`, `intellij` | cask | IntelliJ IDEA |
+| `sublime` | cask | Sublime Text |
+| `iterm`, `iterm2` | cask | iTerm2 |
+| `mysql` | formula + cask | server plus MySQL Workbench |
+| `java`, `jdk` | SDKMAN | the JDKs in `--jdk-versions` |
+| `maven`, `mvn` | SDKMAN | also mirrors `MAVEN_HOME` to `M2_HOME` |
+| `mvnd` | SDKMAN | Maven daemon |
+| `gradle` | SDKMAN | |
+| `scala` | SDKMAN | |
+| `scalacli` | SDKMAN | scala-cli |
+| `sbt` | SDKMAN | |
+| `kotlin` | SDKMAN | |
+| `groovy` | SDKMAN | |
+| `ant` | SDKMAN | |
+| `leiningen`, `lein` | SDKMAN | |
+| `jbang` | SDKMAN | |
+| `spark` | SDKMAN | Apache Spark |
+| `flink` | SDKMAN | Apache Flink |
+| `hadoop` | SDKMAN | Apache Hadoop |
+| `springboot`, `spring` | SDKMAN | Spring Boot CLI |
+| `quarkus` | SDKMAN | Quarkus CLI |
+| `micronaut` | SDKMAN | Micronaut CLI |
+| `visualvm` | SDKMAN | |
+| `jmc` | SDKMAN | JDK Mission Control |
+| `jmeter` | SDKMAN | Apache JMeter |
+| `liquibase` | SDKMAN | |
+| `tomcat` | SDKMAN | Apache Tomcat |
+
+Anything not in the table is looked up in Homebrew (formula first, then cask).
+Prefixes force a specific installer:
+
+| Prefix | Meaning | Example |
+| --- | --- | --- |
+| `sdk:` | an SDKMAN candidate | `sdk:quarkus` |
+| `sdk:`...`@` | pinned to a version | `sdk:scala@2.13.13` |
+| `brew:` | a Homebrew formula | `brew:ripgrep` |
+| `cask:` | a Homebrew cask | `cask:firefox` |
+
+The aliases above are the ones given a short name. SDKMAN offers **eighty-odd**
+candidates in total and the set changes over time, so `sdk list` is the
+authoritative list; any of them is reachable with the `sdk:` prefix.
 
 ## How architecture support works
 
@@ -121,14 +154,39 @@ A few details worth knowing:
 * **A native Homebrew wins over an Intel one.** If both `/opt/homebrew` and
   `/usr/local` contain a `brew`, the architecture-native prefix is used.
 
-## Java: multiple JDKs, switchable
+## The JVM toolchain, via SDKMAN
 
-Java is installed with [SDKMAN](https://sdkman.io) rather than Homebrew casks,
-so several JDKs coexist and you can switch between them. A cask installs one JDK
-per formula and has no switching story.
+Java **and the rest of the JVM toolchain** are installed with
+[SDKMAN](https://sdkman.io) rather than Homebrew, so several versions coexist and
+you can switch between them. Homebrew installs one version per formula and has no
+switching story, which is the wrong shape for tools whose version is dictated by
+the project: Spark pins a Scala version, a build pins a Gradle version, and so on.
 
-By default **JDK 11, 17 and 21** are installed and the highest (21) becomes the
-default:
+```sh
+./Install_Apps_on_Mac.sh spark flink hadoop     # data engines
+./Install_Apps_on_Mac.sh maven gradle sbt       # build tools
+./Install_Apps_on_Mac.sh sdk:scala@2.13.13      # the Scala a Spark 3.x build wants
+./Install_Apps_on_Mac.sh sdk:quarkus            # any candidate, by name
+```
+
+Switching works the same for every candidate:
+
+```sh
+sdk list scala                 # installed and available
+sdk use scala 2.12.18          # this shell only
+sdk default scala 2.13.13      # for new shells
+```
+
+SDKMAN exports `<CANDIDATE>_HOME` for whatever is current, so `JAVA_HOME`,
+`MAVEN_HOME`, `SPARK_HOME`, `FLINK_HOME` and the rest are set for you. Maven is
+the one tool with a legacy second name, so `M2_HOME` is mirrored from
+`MAVEN_HOME` for older tooling that still reads it.
+
+### JDKs specifically
+
+Java is the one candidate with a vendor per architecture, so it gets its own
+flags. By default **JDK 11, 17 and 21** are installed and the highest (21)
+becomes the default:
 
 ```sh
 ./Install_Apps_on_Mac.sh java                      # 11, 17, 21; default 21
@@ -146,7 +204,7 @@ sdk current java                  # what is active now
 sdk home java 11.0.32-tem         # print that JDK's home directory
 ```
 
-### Version identifiers are resolved, not hardcoded
+### JDK identifiers are resolved, not hardcoded
 
 You give feature versions (`17`); the script asks SDKMAN which builds exist for
 your architecture and picks the newest patch release from the first vendor that
@@ -169,12 +227,6 @@ publishes it through SDKMAN, on either architecture. Asking for it reports what
 
 Use 21 (LTS) or 25 (LTS) instead.
 
-### JAVA_HOME
-
-SDKMAN exports `JAVA_HOME` itself, pointing at
-`~/.sdkman/candidates/java/current`, a symlink that follows whatever you set as
-the default. The script does not set `JAVA_HOME`, so nothing fights over it.
-
 ## Environment variables
 
 Two files are used, because they serve different purposes.
@@ -194,14 +246,13 @@ Each gets a single managed block:
 # ~/.zprofile
 # >>> install_apps_on_mac >>>
 eval "$(/opt/homebrew/bin/brew shellenv)"
-export M2_HOME="/opt/homebrew/opt/maven/libexec"
-export PATH="$M2_HOME/bin:$PATH"
 # <<< install_apps_on_mac <<<
 
 # ~/.zshrc
 # >>> install_apps_on_mac-sdkman >>>
 export SDKMAN_DIR="$HOME/.sdkman"
 [ -s "$SDKMAN_DIR/bin/sdkman-init.sh" ] && . "$SDKMAN_DIR/bin/sdkman-init.sh"
+export M2_HOME="${MAVEN_HOME:-$SDKMAN_DIR/candidates/maven/current}"
 # <<< install_apps_on_mac-sdkman <<<
 ```
 
@@ -228,8 +279,11 @@ source ~/.zprofile   # or ~/.bash_profile
 
 **Basic:** git, wget, telnet, netcat, jq, bash-completion, iTerm2, tree
 
-**Advanced:** Visual Studio Code, SDKMAN with JDK 11/17/21 (default 21), Maven,
-IntelliJ IDEA, MySQL + Workbench, Sublime Text
+**Advanced:** Visual Studio Code, SDKMAN with JDK 11/17/21 (default 21), Maven
+(via SDKMAN), IntelliJ IDEA, MySQL + Workbench, Sublime Text
+
+Spark, Flink, Hadoop, Kotlin, Gradle, sbt and the rest are **not** installed by
+default; pass them as arguments or add them to `ADVANCED_APPS_LIST`.
 
 ## MySQL
 
